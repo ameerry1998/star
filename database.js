@@ -18,6 +18,17 @@ async function initDatabase() {
     });
 
     await db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       email TEXT UNIQUE NOT NULL,
+       first_name TEXT,
+       last_name TEXT,
+       oauth_provider TEXT,
+       oauth_provider_id TEXT UNIQUE,
+       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+    
       CREATE TABLE IF NOT EXISTS companies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -60,13 +71,57 @@ async function initDatabase() {
         is_enriched BOOLEAN DEFAULT 0,
         FOREIGN KEY (company_id) REFERENCES companies(id)
       );
+        
+      CREATE TABLE IF NOT EXISTS jobs (
+--           TODO: maybe we should add a date_scraped field
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          company_id INTEGER,
+          title TEXT,
+          description TEXT,
+          job_link TEXT UNIQUE,
+          date_posted TEXT,
+          FOREIGN KEY (company_id) REFERENCES companies(id)   
+      );
+
+      CREATE TABLE IF NOT EXISTS applications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        job_id INTEGER NOT NULL,
+        date_applied TEXT,
+        status TEXT,
+        custom_cv TEXT,
+        custom_cover_letter TEXT,
+        contacts TEXT, -- JSON stringified array
+        communication_history TEXT, -- JSON stringified array
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (job_id) REFERENCES jobs(id)
+        );
 
       CREATE INDEX IF NOT EXISTS idx_companies_name_nocase ON companies(name COLLATE NOCASE);
+      CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
     `);
 
+    //TODO: you can remove the missing column checks below
     // Check and add columns if they don't exist (for existing databases)
     const existingColumns = await db.all("PRAGMA table_info(employees)");
     const columnNames = existingColumns.map(col => col.name);
+
+    const existingJobColumns = await db.all("PRAGMA table_info(jobs)");
+    const jobColumnNames = existingJobColumns.map(col => col.name);
+    if (!jobColumnNames.includes('date_posted')) {
+      await db.run(`ALTER TABLE jobs ADD COLUMN date_posted TEXT`);
+      console.log('Added date_posted column to jobs table.');
+    }
+
+    const applicationColumns = await db.all("PRAGMA table_info(applications)");
+    const applicationColumnNames = applicationColumns.map((col) => col.name);
+
+    if (!applicationColumnNames.includes('resume_suggestions')) {
+      await db.run(`ALTER TABLE applications ADD COLUMN resume_suggestions TEXT`);
+      console.log('Added resume_suggestions column to applications table.');
+    }
+
+    //TODO: you can remove the missing column checks above
 
     const newColumns = [
       { name: 'education', type: 'TEXT' },
@@ -82,6 +137,220 @@ async function initDatabase() {
     }
   }
   return db;
+}
+
+async function saveApplicationToDatabase(applicationData) {
+  const {
+    userId,
+    jobId,
+    dateApplied,
+    status,
+    customCv,
+    customCoverLetter,
+    contacts,
+    communicationHistory
+  } = applicationData;
+
+  try {
+    // Check if the application already exists
+    const existingApplication = await db.get(
+        'SELECT * FROM applications WHERE USER_ID = ? AND JOB_ID = ?',
+        [userId, jobId]
+    );
+
+    if (existingApplication) {
+      console.log(`Application already exists for user ID ${userId} and job ID ${jobId}.`);
+      return existingApplication.id;
+    }
+
+    const result = await db.run(
+        `INSERT INTO applications (user_id, job_id, date_applied, status, custom_cv, custom_cover_letter, contacts, communication_history)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          userId,
+          jobId,
+          dateApplied || new Date().toISOString(),
+          status || 'Applied',
+          customCv || '',
+          customCoverLetter || '',
+          JSON.stringify(contacts || []),
+          JSON.stringify(communicationHistory || [])
+        ]
+    );
+
+    console.log(`Application saved with ID ${result.lastID}.`);
+    return result.lastID;
+  } catch (error) {
+    console.error( 'Error saving application to database:', error.message);
+    throw error;
+  }
+
+
+}
+
+async function saveJobToDatabase(jobData) {
+  const { companyName, jobTitle, jobDescription, jobLink, datePosted } = jobData;
+
+  try {
+    // Ensure the company exists and get its ID
+    const company = await getOrCreateCompany(companyName);
+
+    if (!company) {
+      throw new Error(`Company "${companyName}" could not be found or created.`);
+    }
+
+    // Check if the job already exists
+    let job = await db.get('SELECT * FROM jobs WHERE job_link = ?', [jobLink]);
+
+    if (!job) {
+      // Insert the job into the jobs table
+      const result = await db.run(
+          `INSERT INTO jobs (company_id, title, description, job_link, date_posted)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            company.id,
+            jobTitle,
+            jobDescription,
+            jobLink,
+            datePosted || new Date().toISOString()
+          ]
+      );
+
+      job = {
+        id: result.lastID,
+        company_id: company.id,
+        title: jobTitle,
+        description: jobDescription,
+        job_link: jobLink,
+        date_posted: datePosted || new Date().toISOString()
+      };
+
+      console.log(`Job "${jobTitle}" at "${companyName}" saved to the database with ID ${job.id}.`);
+    } else {
+      console.log(`Job "${jobTitle}" at "${companyName}" already exists in the database with ID ${job.id}.`);
+    }
+
+    return job;
+  } catch (error) {
+    console.error('Error saving job to database:', error.message);
+    throw error;
+  }
+}
+
+async function saveResumeSuggestionsToDatabase(applicationId, suggestions) {
+  try {
+    const suggestionsJson = JSON.stringify(suggestions);
+    await db.run(
+        `UPDATE applications SET resume_suggestions = ? WHERE id = ?`,
+        [suggestionsJson, applicationId]
+    );
+  } catch (error) {
+    console.error('Error saving suggestions to database:', error.message);
+    throw error;
+  }
+}
+
+async function getApplicationsByUserId(userId) {
+  try {
+    const applications = await db.all(
+        `SELECT applications.*, jobs.title AS jobTitle, jobs.description AS jobDescription, jobs.job_link AS jobLink, companies.name AS companyName
+       FROM applications
+       LEFT JOIN jobs ON applications.job_id = jobs.id
+       LEFT JOIN companies ON jobs.company_id = companies.id
+       WHERE applications.user_id = ?`,
+        [userId]
+    );
+    return applications;
+  } catch (error) {
+    console.error('Error fetching applications from database:', error.message);
+    throw error;
+  }
+}
+
+async function getApplicationById(applicationId, userId) {
+  try {
+    const application = await db.get(
+        `SELECT applications.*, jobs.title AS jobTitle, jobs.description AS jobDescription, jobs.job_link AS jobLink, companies.name AS companyName
+         FROM applications
+                LEFT JOIN jobs ON applications.job_id = jobs.id
+                LEFT JOIN companies ON jobs.company_id = companies.id
+         WHERE applications.id = ? AND applications.user_id = ?`,
+        [applicationId, userId]
+    );
+
+    if (application) {
+      if (application.contacts){
+        application.contacts = JSON.parse(application.contacts);
+      }
+      if (application.communication_history) {
+        application.communication_history = JSON.parse(application.communication_history);
+      }
+      // Parse resume_suggestions
+      if (application.resume_suggestions) {
+        try {
+          application.resume_suggestions = JSON.parse(application.resume_suggestions);
+        } catch (error) {
+          console.error('Error parsing resume_suggestions from database:', error.message);
+          application.resume_suggestions = [];
+        }
+      } else {
+        application.resume_suggestions = [];
+      }
+    }
+    return application;
+  } catch (error) {
+    console.error('Error fetching application from database:', error.message);
+    throw error;
+  }
+}
+
+async function getOrCreateUser(userData){
+  const {email, first_name, last_name, oauth_provider, oauth_provider_id} = userData;
+
+  try{
+    let user = await db.get('SELECT * FROM users WHERE email = ? OR oauth_provider_id = ?', [email,oauth_provider_id]);
+
+    if(!user){
+      const result = await db.run(
+          'INSERT INTO users (email, first_name, last_name, oauth_provider, oauth_provider_id) VALUES (?, ?, ?, ?, ?)',
+          [email, first_name, last_name, oauth_provider, oauth_provider_id]);
+      user = {
+        id: result.lastID,
+        email,
+        first_name,
+        last_name,
+        oauth_provider,
+        oauth_provider_id
+      }
+      console.log('New user created:', user);
+    } else {
+      // Update user information if necessary
+      if (
+          user.first_name !== first_name ||
+          user.last_name !== last_name ||
+          user.oauth_provider !== oauth_provider ||
+          user.oauth_provider_id !== oauth_provider_id
+      ) {
+        await db.run(
+            `UPDATE users SET first_name = ?, last_name = ?, oauth_provider = ?, oauth_provider_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [first_name, last_name, oauth_provider, oauth_provider_id, user.id]
+        );
+        user = { ...user, first_name, last_name, oauth_provider, oauth_provider_id };
+        console.log('User information updated:', user);
+      }
+    }
+
+    return user;
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT') {
+      console.log(`Conflict detected for user "${email}". Fetching existing record.`);
+      const existingUser = await db.get('SELECT * FROM users WHERE email = ?', [email]);
+      return existingUser;
+    } else {
+      console.error('Error in getOrCreateUser:', error);
+      throw error;
+    }
+  }
 }
 
 async function listAndDropTables() {
@@ -642,11 +911,27 @@ async function getEmployeeCount() {
   return result.count;
 }
 
+async function getAllJobs() {
+  try {
+    const jobs = await db.all(`
+      SELECT jobs.*, companies.name AS companyName
+      FROM jobs
+      LEFT JOIN companies ON jobs.company_id = companies.id
+    `);
+    return jobs;
+  } catch (error) {
+    console.error('Error fetching all jobs from database:', error.message);
+    throw error;
+  }
+}
+
+
 module.exports = {
   get db() {
     return db;
   },
   initDatabase,
+  saveJobToDatabase,
   saveEmployeesToDatabase,
   searchCompanyEmployees,
   enrichProfile,
@@ -655,5 +940,11 @@ module.exports = {
   getAllCompanies,
   getEmployeeCount,
   listAndDropTables,
-  getOrCreateCompany
+  getOrCreateCompany,
+  getOrCreateUser,
+  saveApplicationToDatabase,
+  getApplicationsByUserId,
+  getApplicationById,
+  getAllJobs,
+  saveResumeSuggestionsToDatabase
 };
