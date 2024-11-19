@@ -27,7 +27,11 @@ const {
   getAllJobs,
   getApplicationsByUserId,
   getApplicationById,
-  saveResumeSuggestionsToDatabase
+  saveResumeSuggestionsToDatabase,
+  getUserPastCompanies,
+  getEmployeesWithMatchingCompanies,
+  getJobById,
+  getCompanyById,
 } = require('./database.js');
 
 // TODO: remove and add dynamic resumes
@@ -600,6 +604,25 @@ app.get('/api/applications/:id', async (req, res) => {
       return res.status(404).json({ error: 'Application not found' });
     }
 
+    // Get target company name
+    const job = await getJobById(application.job_id);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const company = await getCompanyById(job.company_id);
+    if (!company) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+
+    const targetCompanyName = company.name;
+
+    // Retrieve user's past companies
+    const companyNames = await getUserPastCompanies(userId);
+
+    // Find close contacts
+    application.close_contacts = await getEmployeesWithMatchingCompanies(targetCompanyName, companyNames);
+
     // Parse resume_suggestions if it's a JSON string
     if (application.resume_suggestions) {
       try {
@@ -614,6 +637,7 @@ app.get('/api/applications/:id', async (req, res) => {
 
     res.json(application);
   } catch (error) {
+    console.error('Error fetching application:', error);
     res.status(500).json({ error: 'Failed to fetch application' });
   }
 });
@@ -707,6 +731,22 @@ app.get('/api/employees/:companyName', async (req, res) => {
     res.status(500).json({ error: 'Failed to retrieve employees' });
   }
 });
+
+//TODO: check whether we're going to use this endpoint when a user registers or whether we're going to have one endpoint that does all of their analysis
+app.post('/api/users/job-history', async (req, res) => {
+  //TODO: add actual user ID
+  const userId = 1; // Replace with actual user ID from authentication
+  const jobHistory = req.body.jobHistory;
+
+  try {
+    await insertUserJobHistory(userId, jobHistory);
+    res.status(200).json({ message: 'Job history saved successfully.' });
+  } catch (error) {
+    console.error('Error saving user job history:', error);
+    res.status(500).json({ error: 'Failed to save job history.' });
+  }
+});
+
 
 async function startServer() {
   await initDatabase();

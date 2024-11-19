@@ -71,6 +71,22 @@ async function initDatabase() {
         is_enriched BOOLEAN DEFAULT 0,
         FOREIGN KEY (company_id) REFERENCES companies(id)
       );
+
+      CREATE TABLE IF NOT EXISTS employee_job_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id INTEGER NOT NULL,
+        company_id INTEGER,
+        company_name TEXT NOT NULL,
+        company_urn TEXT,
+        company_linkedin_url TEXT,
+        title TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        description TEXT,
+        location TEXT,
+        FOREIGN KEY (employee_id) REFERENCES employees(id),
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+        );
         
       CREATE TABLE IF NOT EXISTS jobs (
 --           TODO: maybe we should add a date_scraped field
@@ -99,6 +115,9 @@ async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_companies_name_nocase ON companies(name COLLATE NOCASE);
       CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
+      CREATE INDEX IF NOT EXISTS idx_employee_job_history_employee_id ON employee_job_history(employee_id);
+      CREATE INDEX IF NOT EXISTS idx_employee_job_history_company_id ON employee_job_history(company_id);
+      CREATE INDEX IF NOT EXISTS idx_employee_job_history_company_name ON employee_job_history(company_name);
     `);
 
     //TODO: you can remove the missing column checks below
@@ -925,6 +944,147 @@ async function getAllJobs() {
   }
 }
 
+async function getJobById(jobId) {
+  try {
+    const job = await db.get('SELECT * FROM jobs WHERE id = ?', [jobId]);
+    return job;
+  } catch (error) {
+    console.error('Error fetching job by ID:', error.message);
+    throw error;
+  }
+}
+
+async function getCompanyById(companyId) {
+  try {
+    const company = await db.get('SELECT * FROM companies WHERE id = ?', [companyId]);
+    return company;
+  } catch (error) {
+    console.error('Error fetching company by ID:', error.message);
+    throw error;
+  }
+}
+
+async function insertUserJobHistory(userId, jobHistoryList) {
+  const stmt = await db.prepare(`
+    INSERT INTO user_job_history (
+      user_id, company_id, company_name, title, start_date, end_date, description, location
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const job of jobHistoryList) {
+    const companyName = job.companyName || 'Unknown';
+    const title = job.title || null;
+    const description = job.description || null;
+    const location = job.locationName || null;
+
+    // Format dates
+    const startDate = formatDate(job.timePeriod?.startDate);
+    const endDate = formatDate(job.timePeriod?.endDate);
+
+    // Get or create company
+    const company = await getOrCreateCompany(companyName);
+
+    await stmt.run([
+      userId,
+      company?.id || null,
+      companyName,
+      title,
+      startDate,
+      endDate,
+      description,
+      location,
+    ]);
+  }
+
+  await stmt.finalize();
+}
+
+async function insertEmployeeJobHistory(employeeId, experienceList) {
+  const stmt = await db.prepare(`
+    INSERT INTO employee_job_history (
+      employee_id, company_id, company_name, company_urn, company_linkedin_url,
+      title, start_date, end_date, description, location
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const exp of experienceList) {
+    const companyName = exp.companyName || exp.company?.companyName || 'Unknown';
+    const companyUrn = exp.companyUrn || exp.company?.companyUrn || null;
+    const companyLinkedInUrl = exp.companyLinkedInUrl || null;
+    const title = exp.title || null;
+    const description = exp.description || null;
+    const location = exp.locationName || null;
+
+    // Start Date
+    const startDateObj = exp.timePeriod?.startDate || {};
+    const startDate = formatDate(startDateObj);
+
+    // End Date
+    const endDateObj = exp.timePeriod?.endDate || {};
+    const endDate = formatDate(endDateObj);
+
+    // Get or create company in companies table
+    const company = await getOrCreateCompany(companyName, null, null, companyLinkedInUrl);
+
+    await stmt.run([
+      employeeId,
+      company?.id || null,
+      companyName,
+      companyUrn,
+      companyLinkedInUrl,
+      title,
+      startDate,
+      endDate,
+      description,
+      location
+    ]);
+  }
+
+  await stmt.finalize();
+}
+
+async function getUserPastCompanies(userId) {
+  const userPastCompanies = await db.all(
+      'SELECT DISTINCT company_name FROM user_job_history WHERE user_id = ?',
+      [userId]
+  );
+  return userPastCompanies.map(c => c.company_name);
+}
+
+async function getEmployeesWithMatchingCompanies(targetCompanyName, companyNames) {
+  if (companyNames.length === 0) {
+    return [];
+  }
+
+  const placeholders = companyNames.map(() => '?').join(',');
+
+  const employees = await db.all(
+      `
+    SELECT DISTINCT e.*
+    FROM employees e
+    INNER JOIN employee_job_history ejh ON e.id = ejh.employee_id
+    WHERE e.current_company COLLATE NOCASE = ?
+      AND ejh.company_name COLLATE NOCASE IN (${placeholders})
+      AND ejh.company_name COLLATE NOCASE != ?
+    `,
+      [targetCompanyName, ...companyNames, targetCompanyName]
+  );
+
+  return employees;
+}
+
+function formatDate(dateObj) {
+  if (!dateObj) return null;
+  const year = dateObj.year || null;
+  const month = dateObj.month || null;
+  if (year && month) {
+    return `${year}-${String(month).padStart(2, '0')}-01`;
+  } else if (year) {
+    return `${year}-01-01`;
+  } else {
+    return null;
+  }
+}
 
 module.exports = {
   get db() {
@@ -946,5 +1106,11 @@ module.exports = {
   getApplicationsByUserId,
   getApplicationById,
   getAllJobs,
-  saveResumeSuggestionsToDatabase
+  saveResumeSuggestionsToDatabase,
+  getJobById,
+  getCompanyById,
+  insertUserJobHistory,
+  insertEmployeeJobHistory,
+  getUserPastCompanies,
+  getEmployeesWithMatchingCompanies,
 };
